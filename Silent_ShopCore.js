@@ -1,6 +1,6 @@
 /*:
  * @target MZ
- * @plugindesc v1.1.4 商店核心：支持限购、多货币系统，变量货币可配置图标。
+ * @plugindesc v1.2 商店核心：支持限购、多货币系统、特殊货币售出价选择。
  * @author Silent
  *
  * @help
@@ -22,6 +22,11 @@
  * 示例：
  * <货币:v,10,500>   -> 价格为 500 点 10号变量
  * <货币:i,1,5>      -> 价格为 5 个 1号物品
+ * 
+ * ============================================================================
+ * 备注：
+ * ============================================================================
+ * 出售倍率仅针对多货币，不涉及原本金币的交易（还是默认的50%回收价格）。
  * 
  * @command setLimit
  * @text 设置限购与显示条件
@@ -96,6 +101,16 @@
  * @type number
  * @default 313
  * 
+ * @param sellRatio
+ * @text 多货币出售倍率
+ * @desc 玩家向商店出售多货币物品时的回收价格倍率。
+ * @type select
+ * @option 原价出售 (100%)
+ * @value 1.0
+ * @option 半价出售 (50%)
+ * @value 0.5
+ * @default 1.0
+ * 
  * @param variableIcons
  * @text 变量货币图标配置
  * @desc 为特定的变量货币设置其在界面显示的图标。
@@ -119,6 +134,8 @@
     const pluginName = "Silent_ShopCore";
     const parameters = PluginManager.parameters(pluginName);
     const pGoldIconId = parseInt(parameters['goldIconId'] || 0);
+    // 新增：读取出售倍率，默认为 1.0 (原价)
+    const pSellRatio = parseFloat(parameters['sellRatio'] || 1.0);
 
     // 解析变量图标映射表
     const vIconMap = {};
@@ -460,24 +477,60 @@
         return _Window_ShopBuy_isEnabled.call(this, item);
     };
 
+    // 修复：Setup逻辑需要区分“买”和“卖”
     const _Window_ShopNumber_setup = Window_ShopNumber.prototype.setup;
     Window_ShopNumber.prototype.setup = function(item, max, price) {
         const cData = getCurrencyData(item);
+        
+        // 判断当前是否处于商店的“出售”模式
+        const scene = SceneManager._scene;
+        const isShopSell = scene instanceof Scene_Shop && 
+                           scene._commandWindow && 
+                           scene._commandWindow.currentSymbol() === 'sell';
+
         let realMax = max;
+        let finalPrice = price;
 
         if (cData) {
-            const owned = getPartyCurrencyValue(cData);
-            const canAfford = Math.floor(owned / cData.cost);
-            const maxItems = $gameParty.maxItems(item) - $gameParty.numItems(item);
-            realMax = Math.min(maxItems, canAfford);
+            // 如果是多货币物品
+            
+            if (isShopSell) {
+                // 出售模式：
+                // 修正：应用出售倍率 (例如：0.5 半价)
+                finalPrice = Math.floor(cData.cost * pSellRatio);
+
+                // max 已经是当前拥有的物品数量（由Scene_Shop传入），不需要重新计算买得起多少个
+                // 也不受商店库存(limitData)的限制
+                realMax = max;
+            } else {
+                // 购买模式：价格永远是原价
+                finalPrice = cData.cost;
+
+                // 计算买得起多少个
+                const owned = getPartyCurrencyValue(cData);
+                const canAfford = Math.floor(owned / cData.cost);
+                // 计算还能拿多少个
+                const maxItems = $gameParty.maxItems(item) - $gameParty.numItems(item);
+                
+                realMax = Math.min(maxItems, canAfford);
+                
+                // 只有在购买时，才应用商店库存限制
+                const limitData = getLimitDataForItem(item);
+                if (limitData) {
+                    realMax = Math.min(realMax, limitData.current);
+                }
+            }
+        } else {
+            // 如果是普通金币物品
+            // 依然需要检查限购逻辑，但仅限购买模式
+            if (!isShopSell) {
+                const limitData = getLimitDataForItem(item);
+                if (limitData) {
+                    realMax = Math.min(realMax, limitData.current);
+                }
+            }
         }
 
-        const limitData = getLimitDataForItem(item);
-        if (limitData) {
-            realMax = Math.min(realMax, limitData.current);
-        }
-
-        const finalPrice = cData ? cData.cost : price;
         _Window_ShopNumber_setup.call(this, item, realMax, finalPrice);
         
         this._currencyData = cData;
@@ -541,7 +594,8 @@
     Scene_Shop.prototype.doSell = function(number) {
         const cData = getCurrencyData(this._item);
         if (cData) {
-            const unitPrice = Math.floor(cData.cost / 2);
+            // 修正：多货币物品出售时，计算倍率后的价格
+            const unitPrice = Math.floor(cData.cost * pSellRatio); 
             const totalAmount = unitPrice * number;
 
             gainPartyCurrency(cData, totalAmount);
