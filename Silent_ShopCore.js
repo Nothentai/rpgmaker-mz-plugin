@@ -1,12 +1,28 @@
 /*:
  * @target MZ
- * @plugindesc v1.0.1 商店核心，可以设置限购次数及显示条件。
+ * @plugindesc v1.1.4 商店核心：支持限购、多货币系统，变量货币可配置图标。
  * @author Silent
  *
  * @help
- * 使用说明：
- * 1. 事件中使用插件指令进行设置即可（可以同时设置多个插件指令，能同时生效）。
+ * ============================================================================
+ * 功能 1: 限购与显示条件
+ * ============================================================================
+ * 使用插件指令进行设置。
+ * 
+ * ============================================================================
+ * 功能 2: 多货币系统
+ * ============================================================================
+ * 在数据库的 物品/武器/防具 备注栏中添加以下标签：
  *
+ * <货币:v,ID,数量>  -> 使用变量作为货币
+ * <货币:i,ID,数量>  -> 使用物品作为货币
+ * <货币:w,ID,数量>  -> 使用武器作为货币
+ * <货币:a,ID,数量>  -> 使用防具作为货币
+ *
+ * 示例：
+ * <货币:v,10,500>   -> 价格为 500 点 10号变量
+ * <货币:i,1,5>      -> 价格为 5 个 1号物品
+ * 
  * @command setLimit
  * @text 设置限购与显示条件
  * @desc 批量为物品设置限购及开启条件（独立计数）。
@@ -69,43 +85,76 @@
  * @arg idPrefix
  * @text 唯一ID前缀
  * @type string
+ *
+ *
+ * ============================================================================
+ * 设置
+ * ============================================================================
+ * @param goldIconId
+ * @text 金币图标ID
+ * @desc 也就是右上角显示金币时，左侧显示的图标索引。
+ * @type number
+ * @default 313
+ * 
+ * @param variableIcons
+ * @text 变量货币图标配置
+ * @desc 为特定的变量货币设置其在界面显示的图标。
+ * @type struct<VarIcon>[]
+ * @default []
+ *
+ */
+
+/*~struct~VarIcon:
+ * @param varId
+ * @text 变量ID
+ * @type variable
+ *
+ * @param iconId
+ * @text 图标ID
+ * @type number
+ * @default 0
  */
 
 (() => {
     const pluginName = "Silent_ShopCore";
+    const parameters = PluginManager.parameters(pluginName);
+    const pGoldIconId = parseInt(parameters['goldIconId'] || 0);
 
-    // --- 数据持久化层 ---
+    // 解析变量图标映射表
+    const vIconMap = {};
+    const rawVIconData = JSON.parse(parameters['variableIcons'] || "[]");
+    rawVIconData.forEach(str => {
+        const obj = JSON.parse(str);
+        if (obj.varId) vIconMap[Number(obj.varId)] = Number(obj.iconId || 0);
+    });
+
+    // ========================================================================
+    //  Part 0: 基础数据结构与工具函数
+    // ========================================================================
+
     const _Game_System_initialize = Game_System.prototype.initialize;
     Game_System.prototype.initialize = function() {
         _Game_System_initialize.call(this);
-        // 全局限购数据
         this._globalShopLimits = {}; 
-        // 非全局（事件）限购数据：{ "mapId_eventId": { key: data } }
         this._persistentEventLimits = {}; 
     };
 
-    // 生成物品唯一识别键
     const makeItemKey = (type, id) => `${type}_${id}`;
-
-    // 生成事件唯一识别键（用于跨地图持久化）
     const makeEventKey = () => {
         const mapId = $gameMap.mapId();
-        const eventId = $gameMap._interpreter.eventId();
+        const eventId = $gameMap._interpreter ? $gameMap._interpreter.eventId() : 0;
         return `${mapId}_${eventId}`;
     };
 
-    // --- 核心：获取限购数据 ---
     const getLimitDataForItem = (item) => {
         if (!item) return null;
         const type = DataManager.isItem(item) ? "item" : (DataManager.isWeapon(item) ? "weapon" : "armor");
         const itemKey = makeItemKey(type, item.id);
         const eventKey = makeEventKey();
 
-        // 1. 优先检查当前事件的持久化数据
         if ($gameSystem._persistentEventLimits[eventKey] && $gameSystem._persistentEventLimits[eventKey][itemKey]) {
             return $gameSystem._persistentEventLimits[eventKey][itemKey];
         }
-        // 2. 检查全局数据
         if ($gameSystem._globalShopLimits[itemKey]) {
             return $gameSystem._globalShopLimits[itemKey];
         }
@@ -121,7 +170,78 @@
         return true;
     };
 
-    // --- 插件指令 ---
+    // 获取货币信息
+    const getCurrencyData = (item) => {
+        if (!item || !item.meta) return null;
+        const meta = item.meta['货币'] || item.meta['Currency']; 
+        if (!meta) return null;
+
+        const match = meta.match(/([viwa]),\s*(\d+),\s*(\d+)/i);
+        if (match) {
+            const type = match[1].toLowerCase();
+            const id = parseInt(match[2]);
+            const cost = parseInt(match[3]);
+            let obj = null;
+            if (type === 'i') obj = $dataItems[id];
+            if (type === 'w') obj = $dataWeapons[id];
+            if (type === 'a') obj = $dataArmors[id];
+            
+            return { type, id, cost, obj };
+        }
+        return null;
+    };
+
+    // 获取当前持有的货币数量
+    const getPartyCurrencyValue = (cData) => {
+        if (!cData) return $gameParty.gold();
+        switch (cData.type) {
+            case 'v': return $gameVariables.value(cData.id);
+            case 'i': 
+            case 'w': 
+            case 'a': return $gameParty.numItems(cData.obj);
+            default: return 0;
+        }
+    };
+
+    const losePartyCurrency = (cData, amount) => {
+        if (!cData) {
+            $gameParty.loseGold(amount);
+            return;
+        }
+        const totalCost = cData.cost * amount;
+        switch (cData.type) {
+            case 'v': 
+                $gameVariables.setValue(cData.id, $gameVariables.value(cData.id) - totalCost);
+                break;
+            case 'i': 
+            case 'w': 
+            case 'a': 
+                $gameParty.loseItem(cData.obj, totalCost);
+                break;
+        }
+    };
+
+    const gainPartyCurrency = (cData, amount) => {
+        if (!cData) {
+            $gameParty.gainGold(amount); 
+            return;
+        }
+        switch (cData.type) {
+            case 'v': 
+                $gameVariables.setValue(cData.id, $gameVariables.value(cData.id) + amount);
+                break;
+            case 'i': 
+            case 'w': 
+            case 'a': 
+                $gameParty.gainItem(cData.obj, amount);
+                break;
+        }
+    };
+
+    // ========================================================================
+    //  Part 1: 插件指令
+    // ========================================================================
+
     PluginManager.registerCommand(pluginName, "setLimit", args => {
         const isGlobal = args.isGlobal === "true";
         const type = args.itemType;
@@ -142,16 +262,13 @@
             };
 
             if (isGlobal) {
-                // 如果已存在全局数据，不覆盖当前购买次数，仅更新配置
                 if (!$gameSystem._globalShopLimits[itemKey]) {
                     $gameSystem._globalShopLimits[itemKey] = data;
                 }
             } else {
-                // 初始化事件持久化容器
                 if (!$gameSystem._persistentEventLimits[eventKey]) {
                     $gameSystem._persistentEventLimits[eventKey] = {};
                 }
-                // 如果该事件该物品未记录过，则初始化
                 if (!$gameSystem._persistentEventLimits[eventKey][itemKey]) {
                     $gameSystem._persistentEventLimits[eventKey][itemKey] = data;
                 }
@@ -166,15 +283,122 @@
                 if (pool[k].batchId === prefix) pool[k].current = pool[k].max;
             }
         };
-        // 重置全局
         resetInPool($gameSystem._globalShopLimits);
-        // 重置所有持久化事件中的匹配项
         for (let eKey in $gameSystem._persistentEventLimits) {
             resetInPool($gameSystem._persistentEventLimits[eKey]);
         }
     });
 
-    // --- 商店界面与逻辑扩展 ---
+    // ========================================================================
+    //  Part 2: UI 核心改造 (Window_Gold 重写)
+    // ========================================================================
+
+    const _Window_Gold_initialize = Window_Gold.prototype.initialize;
+    Window_Gold.prototype.initialize = function(rect) {
+        _Window_Gold_initialize.call(this, rect);
+        this._customCurrencyData = null; 
+    };
+
+    Window_Gold.prototype.setCustomCurrency = function(cData) {
+        this._customCurrencyData = cData;
+        this.refresh();
+    };
+
+    const _Window_Gold_refresh = Window_Gold.prototype.refresh;
+    Window_Gold.prototype.refresh = function() {
+        if (this._customCurrencyData === undefined) {
+            _Window_Gold_refresh.call(this);
+            return;
+        }
+
+        const rect = this.itemLineRect(0);
+        this.contents.clear();
+
+        let value = 0;
+        let iconIndex = 0;
+        let nameText = "";
+        
+        const cData = this._customCurrencyData;
+
+        if (cData) {
+            value = getPartyCurrencyValue(cData);
+            if (cData.obj) {
+                iconIndex = cData.obj.iconIndex;
+                nameText = cData.obj.name;
+            } else if (cData.type === 'v') {
+                iconIndex = vIconMap[cData.id] || 0; 
+                nameText = $dataSystem.variables[cData.id] || "变量 " + cData.id;
+            }
+        } else {
+            value = $gameParty.gold();
+            iconIndex = pGoldIconId; 
+            nameText = TextManager.currencyUnit;
+        }
+
+        let x = rect.x;
+        const iconWidth = ImageManager.iconWidth;
+        
+        if (iconIndex > 0) {
+            this.drawIcon(iconIndex, x, rect.y + 2);
+            x += iconWidth + 4;
+        }
+
+        const nameMaxWidth = rect.width - x - 100; 
+        this.changeTextColor(ColorManager.systemColor());
+        this.drawText(nameText, x, rect.y, nameMaxWidth, "left");
+
+        this.resetTextColor();
+        this.drawText(value, rect.x, rect.y, rect.width, "right");
+    };
+
+    // ========================================================================
+    //  Part 2.2: Scene_Shop 建立窗口联动
+    // ========================================================================
+
+    const _Scene_Shop_createBuyWindow = Scene_Shop.prototype.createBuyWindow;
+    Scene_Shop.prototype.createBuyWindow = function() {
+        _Scene_Shop_createBuyWindow.call(this);
+        this._goldWindow._customCurrencyData = null; 
+        this._buyWindow.setGoldWindow(this._goldWindow);
+    };
+
+    const _Scene_Shop_createSellWindow = Scene_Shop.prototype.createSellWindow;
+    Scene_Shop.prototype.createSellWindow = function() {
+        _Scene_Shop_createSellWindow.call(this);
+        this._sellWindow.setGoldWindow(this._goldWindow);
+    };
+
+    Window_ShopBuy.prototype.setGoldWindow = function(goldWindow) {
+        this._linkedGoldWindow = goldWindow;
+    };
+
+    const _Window_ShopBuy_updateHelp = Window_ShopBuy.prototype.updateHelp;
+    Window_ShopBuy.prototype.updateHelp = function() {
+        _Window_ShopBuy_updateHelp.call(this);
+        if (this._linkedGoldWindow && this.item()) {
+            const cData = getCurrencyData(this.item());
+            this._linkedGoldWindow.setCustomCurrency(cData);
+        }
+    };
+
+    Window_ShopSell.prototype.setGoldWindow = function(goldWindow) {
+        this._linkedGoldWindow = goldWindow;
+    };
+
+    const _Window_ShopSell_updateHelp = Window_ShopSell.prototype.updateHelp;
+    Window_ShopSell.prototype.updateHelp = function() {
+        _Window_ShopSell_updateHelp.call(this);
+        if (this._linkedGoldWindow) {
+            const item = this.item();
+            const cData = getCurrencyData(item);
+            this._linkedGoldWindow.setCustomCurrency(cData);
+        }
+    };
+
+    // ========================================================================
+    //  Part 3: 列表显示与购买逻辑 (更新列表中的变量图标)
+    // ========================================================================
+
     const _Window_ShopBuy_makeItemList = Window_ShopBuy.prototype.makeItemList;
     Window_ShopBuy.prototype.makeItemList = function() {
         _Window_ShopBuy_makeItemList.call(this);
@@ -185,49 +409,171 @@
             const limitData = getLimitDataForItem(item);
             if (checkVisibleCondition(limitData)) {
                 newData.push(item);
-                newPrice.push(this._price[i]);
+                newPrice.push(this._price[i]); 
             }
         }
         this._data = newData;
         this._price = newPrice;
     };
 
-    const _Window_ShopNumber_setup = Window_ShopNumber.prototype.setup;
-    Window_ShopNumber.prototype.setup = function(item, max, price) {
-        const limitData = getLimitDataForItem(item);
-        const finalMax = limitData ? Math.min(max, limitData.current) : max;
-        _Window_ShopNumber_setup.call(this, item, finalMax, price);
-    };
-
-    const _Scene_Shop_doBuy = Scene_Shop.prototype.doBuy;
-    Scene_Shop.prototype.doBuy = function(number) {
-        _Scene_Shop_doBuy.call(this, number);
-        const limitData = getLimitDataForItem(this._item);
-        if (limitData) {
-            limitData.current = Math.max(0, limitData.current - number);
+    const _Window_ShopBuy_drawItem = Window_ShopBuy.prototype.drawItem;
+    Window_ShopBuy.prototype.drawItem = function(index) {
+        const item = this.itemAt(index);
+        const cData = getCurrencyData(item);
+        
+        if (!cData) {
+            _Window_ShopBuy_drawItem.call(this, index);
+            return;
         }
+
+        const rect = this.itemLineRect(index);
+        this.changePaintOpacity(this.isEnabled(item));
+        this.drawItemName(item, rect.x, rect.y, rect.width);
+        
+        const priceWidth = this.priceWidth();
+        const priceX = rect.x + rect.width - priceWidth;
+        const iconWidthPlus = ImageManager.iconWidth + 4;
+
+        let drawIconIndex = 0;
+        if (cData.obj) drawIconIndex = cData.obj.iconIndex;
+        else if (cData.type === 'v') drawIconIndex = vIconMap[cData.id] || 0;
+
+        if (drawIconIndex > 0) {
+            this.drawIcon(drawIconIndex, priceX, rect.y + 2);
+            this.drawText(cData.cost, priceX + iconWidthPlus, rect.y, priceWidth - iconWidthPlus, "right");
+        } else {
+            this.drawText(cData.cost, priceX, rect.y, priceWidth, "right");
+        }
+        this.changePaintOpacity(true);
     };
 
     const _Window_ShopBuy_isEnabled = Window_ShopBuy.prototype.isEnabled;
     Window_ShopBuy.prototype.isEnabled = function(item) {
-        const original = _Window_ShopBuy_isEnabled.call(this, item);
         const limitData = getLimitDataForItem(item);
         if (limitData && limitData.current <= 0) return false;
-        return original;
+
+        const cData = getCurrencyData(item);
+        if (cData) {
+            const owned = getPartyCurrencyValue(cData);
+            return owned >= cData.cost;
+        }
+        return _Window_ShopBuy_isEnabled.call(this, item);
     };
 
+    const _Window_ShopNumber_setup = Window_ShopNumber.prototype.setup;
+    Window_ShopNumber.prototype.setup = function(item, max, price) {
+        const cData = getCurrencyData(item);
+        let realMax = max;
+
+        if (cData) {
+            const owned = getPartyCurrencyValue(cData);
+            const canAfford = Math.floor(owned / cData.cost);
+            const maxItems = $gameParty.maxItems(item) - $gameParty.numItems(item);
+            realMax = Math.min(maxItems, canAfford);
+        }
+
+        const limitData = getLimitDataForItem(item);
+        if (limitData) {
+            realMax = Math.min(realMax, limitData.current);
+        }
+
+        const finalPrice = cData ? cData.cost : price;
+        _Window_ShopNumber_setup.call(this, item, realMax, finalPrice);
+        
+        this._currencyData = cData;
+    };
+
+    const _Window_ShopNumber_drawTotalPrice = Window_ShopNumber.prototype.drawTotalPrice;
+    Window_ShopNumber.prototype.drawTotalPrice = function() {
+        if (!this._currencyData) {
+            _Window_ShopNumber_drawTotalPrice.call(this);
+            return;
+        }
+        const total = this._price * this._number;
+        const width = this.innerWidth - this.itemPadding() * 2;
+        const y = this.totalPriceY();
+        
+        this.resetTextColor();
+        const cData = this._currencyData;
+
+        let iconIdx = 0;
+        if (cData.obj) iconIdx = cData.obj.iconIndex;
+        else if (cData.type === 'v') iconIdx = vIconMap[cData.id] || 0;
+        
+        if (iconIdx > 0) {
+            const iconW = ImageManager.iconWidth;
+            this.drawText(total, 0, y, width, "right");
+            const textWidth = this.textWidth(total);
+            const iconX = width - textWidth - iconW - 4;
+            this.drawIcon(iconIdx, iconX, y + 2);
+        } else {
+            this.drawText(total, 0, y, width, "right");
+        }
+    };
+
+    // ========================================================================
+    //  Part 4: 交易执行
+    // ========================================================================
+
+    const _Scene_Shop_doBuy = Scene_Shop.prototype.doBuy;
+    Scene_Shop.prototype.doBuy = function(number) {
+        const cData = getCurrencyData(this._item);
+        if (cData) {
+            losePartyCurrency(cData, number);
+            $gameParty.gainItem(this._item, number);
+            
+            const limitData = getLimitDataForItem(this._item);
+            if (limitData) {
+                limitData.current = Math.max(0, limitData.current - number);
+            }
+            
+            SoundManager.playShop();
+            this._goldWindow.refresh(); 
+            this._statusWindow.refresh();
+            this.activateBuyWindow();
+            this._buyWindow.refresh(); 
+        } else {
+            _Scene_Shop_doBuy.call(this, number);
+        }
+    };
+
+    const _Scene_Shop_doSell = Scene_Shop.prototype.doSell;
+    Scene_Shop.prototype.doSell = function(number) {
+        const cData = getCurrencyData(this._item);
+        if (cData) {
+            const unitPrice = Math.floor(cData.cost / 2);
+            const totalAmount = unitPrice * number;
+
+            gainPartyCurrency(cData, totalAmount);
+            $gameParty.loseItem(this._item, number);
+            
+            SoundManager.playShop();
+            this._goldWindow.refresh();
+            this._statusWindow.refresh();
+            this.activateSellWindow();
+            this._sellWindow.refresh();
+        } else {
+            _Scene_Shop_doSell.call(this, number);
+        }
+    };
+
+    // ========================================================================
+    //  Part 5: 状态窗口增强
+    // ========================================================================
+    
     const _Window_ShopStatus_refresh = Window_ShopStatus.prototype.refresh;
     Window_ShopStatus.prototype.refresh = function() {
         _Window_ShopStatus_refresh.call(this);
-        if (this._item) {
-            const limitData = getLimitDataForItem(this._item);
-            if (limitData) {
-                const y = this.innerHeight - this.lineHeight() - 10;
-                this.contents.fontSize = 18;
-                this.changeTextColor("#ff4d4d"); 
-                this.drawText(`可购买次数 ${limitData.current}/${limitData.max}`, 4, y, this.innerWidth - 8, "center");
-                this.resetFontSettings();
-            }
+        if (!this._item) return;
+
+        const limitData = getLimitDataForItem(this._item);
+        if (limitData) {
+            let y = this.innerHeight - this.lineHeight() - 10;
+            this.contents.fontSize = 18;
+            this.changeTextColor("#ff4d4d"); 
+            this.drawText(`可购买次数 ${limitData.current}/${limitData.max}`, 4, y, this.innerWidth - 8, "center");
+            this.resetFontSettings();
         }
     };
+
 })();
